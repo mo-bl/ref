@@ -14,6 +14,8 @@ regenerate ``settings.yaml`` from scratch (destroying all existing secrets).
 """
 
 import argparse
+import os
+import re
 import secrets
 import subprocess
 import sys
@@ -53,11 +55,17 @@ def build_default_settings() -> Dict[str, Any]:
             "https_host_port": 8443,
         },
         "tls": {
-            # off = plain HTTP, internal = self-signed, acme = Let's Encrypt
+            # off = plain HTTP, internal = self-signed, acme = Let's Encrypt,
+            # custom = user-provided certificate (cert_file + key_file)
             "mode": "off",
             "domain": None,
-            # Redirect HTTP to HTTPS (only applies to internal and acme modes).
+            # Redirect HTTP to HTTPS (only applies to internal mode; acme and
+            # custom always redirect).
             "redirect_http_to_https": False,
+            # Host paths to a PEM certificate (full chain) and its private key.
+            # Only used in custom mode.
+            "cert_file": None,
+            "key_file": None,
         },
         "paths": {
             "data": "./data",
@@ -115,8 +123,12 @@ SETTINGS_YAML_SECTIONS = [
         "#              plain HTTP on http_host_port)\n"
         "#   acme     — Let's Encrypt via ACME (requires a valid domain,\n"
         "#              ports 80+443 reachable from the internet)\n"
+        "#   custom   — your own certificate: set cert_file (PEM, full chain)\n"
+        "#              and key_file (PEM private key) to host paths. Caddy\n"
+        "#              does not watch these files; after renewing the\n"
+        "#              certificate, run ./ctrl.sh restart.\n"
         "# Set redirect_http_to_https to true to redirect HTTP to HTTPS\n"
-        "# (only applies to internal and acme modes).\n"
+        "# (only applies to internal mode; acme and custom always redirect).\n"
         "# After changing, run ./prepare.py && ./ctrl.sh restart.",
     ),
     (
@@ -176,6 +188,8 @@ BACKFILL_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "mode": "off",
         "domain": None,
         "redirect_http_to_https": False,
+        "cert_file": None,
+        "key_file": None,
     },
     "paths": {
         "data": "./data",
@@ -221,15 +235,77 @@ def load_settings_yaml() -> Dict[str, Any]:
     return settings
 
 
+TLS_MODES = ("off", "internal", "acme", "custom")
+
+# The domain is interpolated into the Caddyfile, so only plain hostnames (or
+# IPv4 addresses) are accepted. Keep in sync with frontend-proxy/render_caddyfile.py.
+HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+# Characters that would break the quoted docker-compose volume spec
+# ("<host>:<container>:ro") or trigger compose variable interpolation.
+UNSAFE_MOUNT_PATH_RE = re.compile(r'[:"\\$\x00-\x1f\x7f]')
+
+
+def resolve_host_path(path: str) -> Path:
+    """Make a settings.yaml path (absolute or relative to the repo root) absolute.
+
+    Symlinks are deliberately not resolved: certificate tools such as certbot
+    point stable symlinks at the current files, and docker resolves them on
+    every container start.
+    """
+    return Path(os.path.normpath(REPO_ROOT / Path(path).expanduser()))
+
+
 def validate_settings(settings: Dict[str, Any]) -> None:
     """Validate cross-field constraints in the settings."""
-    tls_mode = settings.get("tls", {}).get("mode", "off")
-    tls_domain = settings.get("tls", {}).get("domain")
-    if tls_mode in ("internal", "acme") and not tls_domain:
+    tls = settings.get("tls", {})
+    tls_mode = tls.get("mode", "off")
+    if tls_mode not in TLS_MODES:
+        sys.exit(
+            f"error: unknown tls.mode '{tls_mode}' (expected {'|'.join(TLS_MODES)}).\n"
+            f"Fix it in {SETTINGS_YAML.name} and re-run ./prepare.py."
+        )
+    if tls_mode in ("internal", "acme", "custom") and not tls.get("domain"):
         sys.exit(
             f"error: tls.domain must be set when tls.mode is '{tls_mode}'.\n"
             f"Set it in {SETTINGS_YAML.name} and re-run ./prepare.py."
         )
+    if tls.get("domain") and not HOSTNAME_RE.fullmatch(str(tls["domain"])):
+        sys.exit(
+            f"error: tls.domain {tls['domain']!r} is not a valid hostname.\n"
+            f"Fix it in {SETTINGS_YAML.name} and re-run ./prepare.py."
+        )
+    if tls_mode == "custom":
+        for key in ("cert_file", "key_file"):
+            if not tls.get(key):
+                sys.exit(
+                    f"error: tls.{key} must be set when tls.mode is 'custom'.\n"
+                    f"Set it in {SETTINGS_YAML.name} and re-run ./prepare.py."
+                )
+            path = resolve_host_path(str(tls[key]))
+            if UNSAFE_MOUNT_PATH_RE.search(str(path)):
+                sys.exit(
+                    f"error: tls.{key} ({str(path)!r}) must not contain ':', '\"', "
+                    "'\\', '$', or control characters."
+                )
+            try:
+                is_file = path.is_file()
+                mode = path.stat().st_mode if is_file else 0
+            except PermissionError:
+                # e.g. a key below /etc/ssl/private when prepare.py runs
+                # unprivileged. Docker mounts it as root, so this may be fine.
+                print(f"warning: cannot access tls.{key} ({path}) to verify it exists")
+                continue
+            if not is_file:
+                sys.exit(f"error: tls.{key} ({path}) does not exist or is not a file.")
+            if key == "key_file" and mode & 0o004:
+                print(
+                    f"warning: tls.key_file ({path}) is world-readable; "
+                    f"restrict it, e.g. chmod 600 {path}"
+                )
 
 
 def render_settings_env(settings: Dict[str, Any]) -> None:
@@ -264,7 +340,8 @@ def render_settings_env(settings: Dict[str, Any]) -> None:
         f"HTTPS_HOST_PORT={settings['ports']['https_host_port']}",
         "",
         "# TLS mode for the frontend-proxy. off = plain HTTP,",
-        "# internal = self-signed certificate, acme = Let's Encrypt.",
+        "# internal = self-signed certificate, acme = Let's Encrypt,",
+        "# custom = user-provided certificate (mounted by docker-compose.yml).",
         f"TLS_MODE={settings['tls']['mode']}",
         f"TLS_DOMAIN={settings['tls']['domain'] or ''}",
         f"TLS_REDIRECT_HTTP={'true' if settings['tls'].get('redirect_http_to_https') else 'false'}",
@@ -287,6 +364,13 @@ def render_settings_env(settings: Dict[str, Any]) -> None:
     SETTINGS_ENV.chmod(0o600)
 
 
+def tls_host_path(settings: Dict[str, Any], key: str) -> str:
+    """Absolute host path of a custom-mode TLS file, or "" if unused."""
+    if settings["tls"]["mode"] != "custom":
+        return ""
+    return str(resolve_host_path(settings["tls"][key]))
+
+
 def generate_docker_compose(settings: Dict[str, Any]) -> None:
     template_loader = jinja2.FileSystemLoader(searchpath=str(REPO_ROOT))
     template_env = jinja2.Environment(loader=template_loader)
@@ -306,6 +390,8 @@ def generate_docker_compose(settings: Dict[str, Any]) -> None:
         instances_cgroup_parent=instances_cgroup_parent,
         binfmt_support=settings["runtime"]["binfmt_support"],
         tls_mode=settings["tls"]["mode"],
+        tls_cert_file=tls_host_path(settings, "cert_file"),
+        tls_key_file=tls_host_path(settings, "key_file"),
     )
     COMPOSE_OUT.write_text(render_out)
 

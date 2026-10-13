@@ -140,6 +140,11 @@ services:
             # container restarts. Essential for acme mode (avoids
             # hitting Let's Encrypt rate limits).
             - caddy-data:/data
+    {%- if tls_mode == 'custom' %}
+            # User-provided certificate (tls.cert_file / tls.key_file).
+            - "{{ tls_cert_file }}:/etc/caddy/tls/cert.pem:ro"
+            - "{{ tls_key_file }}:/etc/caddy/tls/key.pem:ro"
+    {%- endif %}
     {%- if not testing %}
         ports:
     {%- if tls_mode == 'off' %}
@@ -147,7 +152,7 @@ services:
     {%- elif tls_mode == 'internal' %}
             - "${HTTP_HOST_PORT}:8080"
             - "${HTTPS_HOST_PORT}:8443"
-    {%- elif tls_mode == 'acme' %}
+    {%- elif tls_mode in ('acme', 'custom') %}
             - "${HTTP_HOST_PORT}:80"
             - "${HTTPS_HOST_PORT}:443"
     {%- endif %}
@@ -164,6 +169,10 @@ services:
             test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://localhost:8443/static/favicon.ico"]
     {%- elif tls_mode == 'acme' %}
             test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://localhost:443/static/favicon.ico"]
+    {%- elif tls_mode == 'custom' %}
+            # Requests for any host other than DOMAIN are redirected, so the
+            # check has to name the configured domain.
+            test: ["CMD-SHELL", "wget -q --spider --no-check-certificate --header \"Host: $$DOMAIN\" https://localhost:443/static/favicon.ico"]
     {%- endif %}
             interval: 10s
             timeout: 3s

@@ -58,4 +58,31 @@ http://:8080 {
 	}
 	import /etc/caddy/Caddyfile.routes
 }
+{% elif tls_mode == 'custom' %}
+{
+	admin off
+	auto_https disable_redirects
+	default_sni {{ domain }}
+}
+
+{{ domain }}:443 {
+	tls {{ cert_file }} {{ key_file }}
+	log {
+		output stdout
+		format console
+	}
+	import /etc/caddy/Caddyfile.routes
+}
+
+# Catch-all for clients without a matching SNI or Host (direct IP access,
+# foreign Host headers): complete the handshake with the same certificate,
+# then send them to the canonical domain instead of serving the app.
+:443 {
+	tls {{ cert_file }} {{ key_file }}
+	redir https://{{ domain }}{% if https_host_port != '443' %}:{{ https_host_port }}{% endif %}{uri} permanent
+}
+
+http://:80 {
+	redir https://{{ domain }}{% if https_host_port != '443' %}:{{ https_host_port }}{% endif %}{uri} permanent
+}
 {% endif %}
