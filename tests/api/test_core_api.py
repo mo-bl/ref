@@ -327,6 +327,38 @@ class TestApiInstanceInfo:
 
 @pytest.mark.api
 @pytest.mark.security
+class TestApiInstanceSettings:
+    """
+    Tests for /api/instance/settings endpoint.
+
+    This endpoint requires signed container request and returns a small
+    dict of system-setting values that the in-container task script needs.
+    """
+
+    def test_missing_json_body(self, raw_client: httpx.Client) -> None:
+        """Request without JSON body should return error."""
+        response = raw_client.post("/api/instance/settings")
+        assert response.status_code == 400
+
+    def test_invalid_signature(self, raw_client: httpx.Client) -> None:
+        """Invalid signature should be rejected."""
+        response = raw_client.post(
+            "/api/instance/settings",
+            json={"instance_id": 1},
+        )
+        assert response.status_code == 400
+
+    def test_string_payload(self, raw_client: httpx.Client) -> None:
+        """String payload that's not a valid signed token should be rejected."""
+        response = raw_client.post(
+            "/api/instance/settings",
+            json="invalid_token_string",
+        )
+        assert response.status_code == 400
+
+
+@pytest.mark.api
+@pytest.mark.security
 class TestApiInputValidation:
     """
     General input validation tests across API endpoints.

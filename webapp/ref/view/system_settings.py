@@ -38,6 +38,13 @@ class GeneralSettings(Form):
         "Enable maintenance mode: Disallow any new access by non admin users. Beware: Already established connections are not closed."
     )
     disable_submission = BooleanField("Disable submission for instances.")
+    submission_skip_confirmation = BooleanField(
+        'Skip the "are you sure?" prompt when students run "task submit". '
+        "Warning: submissions go through even when submission tests fail, "
+        "which is rarely what students want. Each submission also stores a "
+        "full overlay snapshot and consumes considerable disk space — only "
+        "enable on small instances."
+    )
     hide_ongoing_exercises_for_grading_assistant = BooleanField(
         "Hide submission that belong to ongoing exercises for the Grading Assistant."
     )
@@ -110,6 +117,10 @@ def view_system_settings():
         (
             SystemSettingsManager.SUBMISSION_DISABLED,
             general_settings_form.disable_submission,
+        ),
+        (
+            SystemSettingsManager.SUBMISSION_SKIP_CONFIRMATION,
+            general_settings_form.submission_skip_confirmation,
         ),
         (
             SystemSettingsManager.SUBMISSION_HIDE_ONGOING,

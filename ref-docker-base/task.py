@@ -20,6 +20,7 @@ from ref_utils import (
     InstanceInfoError,
     TaskTestResult,
     get_instance_info,
+    get_instance_settings,
     print_err,
     print_ok,
     print_warn,
@@ -222,7 +223,16 @@ def cmd_submit(args: argparse.Namespace):
     test_output, test_results = _run_tests(result_will_be_submitted=True)
     any_test_failed = any([not t.success for t in test_results])
 
-    if not args.yes:
+    skip_confirmation = args.yes
+    if not skip_confirmation:
+        try:
+            skip_confirmation = get_instance_settings().submission_skip_confirmation
+        except InstanceInfoError:
+            # Fail closed: when in doubt, ask the user. This avoids a
+            # webapp outage silently turning into auto-submissions.
+            skip_confirmation = False
+
+    if not skip_confirmation:
         if any_test_failed:
             print_warn(
                 "[!] Failing tests may indicate that your solution is erroneous or not complete yet."

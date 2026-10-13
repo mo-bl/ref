@@ -236,6 +236,43 @@ def api_instance_submit():
     )
 
 
+@refbp.route("/api/instance/settings", methods=("GET", "POST"))
+@limiter.limit("10 per minute")
+def api_instance_settings():
+    """Return system-setting values that affect in-container behavior.
+
+    The container's ``task`` script calls this to learn which knobs the
+    admin has flipped (e.g. whether to skip the submission confirmation
+    prompt). Only fields that the container needs are exposed.
+
+    Body (signed): ``{"instance_id": int}``.
+    """
+    try:
+        content = _unwrap_signed_container_request(request)
+    except SignatureUnwrappingError as e:
+        return error_response(e.user_error_message)
+
+    instance_id = content.get("instance_id")
+    try:
+        instance_id = int(instance_id)
+    except (TypeError, ValueError):
+        log.warning(f"Invalid instance id {instance_id}", exc_info=True)
+        return error_response("Invalid instance ID")
+
+    instance = Instance.query.filter(Instance.id == instance_id).one_or_none()
+    if not instance:
+        log.warning(f"Invalid instance id {instance_id}")
+        return error_response("Invalid request")
+
+    return ok_response(
+        {
+            "submission_skip_confirmation": bool(
+                SystemSettingsManager.SUBMISSION_SKIP_CONFIRMATION.value
+            ),
+        }
+    )
+
+
 @refbp.route("/api/instance/info", methods=("GET", "POST"))
 @limiter.limit("10 per minute")
 def api_instance_info():

@@ -37,6 +37,15 @@ System Settings
             </div>
             <div class="col-md-12">
                 <div class="form-group">
+                    {{ wtf_utils.render_field(general_settings_form.submission_skip_confirmation, "checkbox") }}
+                    <small class="form-text text-warning">
+                        Submissions go through even when submission tests fail, which is rarely what students want.
+                        Also causes considerable resource usage; recommended only on small instances.
+                    </small>
+                </div>
+            </div>
+            <div class="col-md-12">
+                <div class="form-group">
                     {{ wtf_utils.render_field(general_settings_form.hide_ongoing_exercises_for_grading_assistant, "checkbox") }}
                 </div>
             </div>

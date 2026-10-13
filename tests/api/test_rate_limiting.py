@@ -125,6 +125,20 @@ class TestInstanceApiRateLimiting:
         )
         assert response.status_code == 400
 
+    def test_instance_settings_rate_limit_documented(
+        self, raw_client: httpx.Client
+    ) -> None:
+        """
+        Document rate limiting behavior for /api/instance/settings.
+
+        Rate limit: 10 per minute
+        """
+        response = raw_client.post(
+            "/api/instance/settings",
+            json="invalid_token",
+        )
+        assert response.status_code == 400
+
 
 @pytest.mark.api
 @pytest.mark.security
