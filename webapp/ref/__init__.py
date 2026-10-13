@@ -456,15 +456,26 @@ def get_config(config):
 
 def fix_stuck_exercise_builds(app: Flask):
     """
-    Resets any exercises that are stuck in BUILDING status back to NOT_BUILD.
-    This can happen if the server was restarted during a build.
+    Recover exercises whose build thread was killed by a server restart.
+
+    BUILDING means a regular build was in progress and no image exists,
+    so we drop back to NOT_BUILD. REBUILDING means an atomic rebuild over
+    an already-built exercise was in progress; the canonical image tag
+    still points at the previous-good image, so we restore FINISHED. Any
+    rebuild temp tags left behind are reaped by the next rebuild — they
+    are harmless on their own.
     """
     with app.app_context():
         from ref.model import Exercise, ExerciseBuildStatus
 
         try:
-            stuck = Exercise.query.filter_by(
-                build_job_status=ExerciseBuildStatus.BUILDING
+            stuck = Exercise.query.filter(
+                Exercise.build_job_status.in_(
+                    [
+                        ExerciseBuildStatus.BUILDING,
+                        ExerciseBuildStatus.REBUILDING,
+                    ]
+                )
             ).all()
         except Exception:
             app.db.session.rollback()
@@ -475,12 +486,24 @@ def fix_stuck_exercise_builds(app: Flask):
             return
 
         if stuck:
+            building_count = 0
+            rebuilding_count = 0
             for ex in stuck:
-                ex.build_job_status = ExerciseBuildStatus.NOT_BUILD
+                if ex.build_job_status == ExerciseBuildStatus.REBUILDING:
+                    ex.build_job_status = ExerciseBuildStatus.FINISHED
+                    rebuilding_count += 1
+                else:
+                    ex.build_job_status = ExerciseBuildStatus.NOT_BUILD
+                    building_count += 1
             app.db.session.commit()
-            app.logger.warning(
-                f"Reset {len(stuck)} exercises from BUILDING to NOT_BUILD on startup."
-            )
+            if building_count:
+                app.logger.warning(
+                    f"Reset {building_count} exercises from BUILDING to NOT_BUILD on startup."
+                )
+            if rebuilding_count:
+                app.logger.warning(
+                    f"Reset {rebuilding_count} exercises from REBUILDING to FINISHED on startup."
+                )
 
 
 @flask_failsafe

@@ -115,7 +115,14 @@ def api_scoreboard_config():
         row[0]
         for row in db.session.query(Exercise.short_name)
         .filter(
-            Exercise.build_job_status == ExerciseBuildStatus.FINISHED,
+            # REBUILDING also serves the previous-good image to students,
+            # so the exercise is "online" from a scoreboard perspective.
+            Exercise.build_job_status.in_(
+                [
+                    ExerciseBuildStatus.FINISHED,
+                    ExerciseBuildStatus.REBUILDING,
+                ]
+            ),
             Exercise.is_default.is_(True),
         )
         .distinct()

@@ -18,10 +18,17 @@ class CourseOfStudies(Enum):
 class ExerciseBuildStatus(Enum):
     """
     Possible states an exercise can be in.
+
+    REBUILDING is set during an atomic rebuild over an already-built
+    exercise: the canonical image tag still points at the previous-good
+    image (so instance provisioning keeps working) while a new image is
+    being built to a temporary tag. On success the canonical tag is
+    promoted and the status flips to FINISHED.
     """
 
     NOT_BUILD = "NOT_BUILD"
     BUILDING = "BUILDING"
+    REBUILDING = "REBUILDING"
     FINISHED = "FINISHED"
     FAILED = "FAILED"
 

@@ -141,6 +141,7 @@ def exercise_build(exercise_id):
 
     if exercise.build_job_status in [
         ExerciseBuildStatus.BUILDING,
+        ExerciseBuildStatus.REBUILDING,
         ExerciseBuildStatus.FINISHED,
     ]:
         log.warning(
@@ -161,6 +162,33 @@ def exercise_build(exercise_id):
         flash.info("Build started...")
         mgr.build()
         return redirect_to_next()
+
+
+@refbp.route("/admin/exercise/rebuild/<int:exercise_id>")
+@admin_required
+def exercise_rebuild(exercise_id):
+    """
+    Rebuild the exercise image without using Docker's layer cache.
+    Used to pick up a refreshed base image.
+    """
+    exercise: Exercise = db.get(Exercise, id=exercise_id)
+    if not exercise:
+        log.info(f"Unknown exercise ID {exercise_id}")
+        flash.warning(f"Unknown exercise ID {exercise_id}")
+        abort(400)
+
+    if exercise.build_job_status in [
+        ExerciseBuildStatus.BUILDING,
+        ExerciseBuildStatus.REBUILDING,
+    ]:
+        log.warning(f"Rebuild requested while {exercise} is already building")
+        flash.error("Build already in progress")
+        abort(400)
+
+    current_app.logger.info(f"Starting rebuild for exercise {exercise}.")
+    flash.info("Rebuild started...")
+    ExerciseImageManager(exercise).build(rebuild=True)
+    return redirect_to_next()
 
 
 @refbp.route("/admin/exercise/diff")
@@ -358,12 +386,31 @@ def exercise_view_all():
 
     for exercise in exercises:
         is_build = ExerciseImageManager(exercise).is_build()
-        if exercise.build_job_status != ExerciseBuildStatus.FINISHED and is_build:
-            # Already build
+        status = exercise.build_job_status
+        # Only auto-promote NOT_BUILD → FINISHED when an image exists.
+        # FAILED is left alone on purpose: after a failed atomic rebuild
+        # the previous-good image is still tagged, but the failure is real
+        # and the admin should see it.
+        if status == ExerciseBuildStatus.NOT_BUILD and is_build:
             exercise.build_job_status = ExerciseBuildStatus.FINISHED
             db.session.add(exercise)
-        elif exercise.build_job_status == ExerciseBuildStatus.FINISHED and not is_build:
-            # Image got deleted
+        elif status == ExerciseBuildStatus.FINISHED and not is_build:
+            # Image got deleted out from under us.
+            exercise.is_default = False
+            exercise.build_job_status = ExerciseBuildStatus.NOT_BUILD
+            db.session.add(exercise)
+        elif status == ExerciseBuildStatus.REBUILDING and not is_build:
+            # Atomic-rebuild contract: canonical tag must stay present for
+            # the full REBUILDING window so instance provisioning can keep
+            # running off the previous-good image. A missing image here
+            # means the contract was broken from outside REF (manual
+            # docker rmi, daemon failure, etc.). Drop to NOT_BUILD and
+            # log loudly.
+            log.warning(
+                f"Exercise {exercise} is REBUILDING but its canonical "
+                "image tag is missing; the atomic-rebuild invariant was "
+                "violated externally. Resetting to NOT_BUILD."
+            )
             exercise.is_default = False
             exercise.build_job_status = ExerciseBuildStatus.NOT_BUILD
             db.session.add(exercise)
@@ -405,8 +452,11 @@ def exercise_delete(exercise_id):
             )
             return redirect_to_next()
 
-    if exercise.build_job_status == ExerciseBuildStatus.BUILDING:
-        flash.error("Unable to delete exercise during building")
+    if exercise.build_job_status in [
+        ExerciseBuildStatus.BUILDING,
+        ExerciseBuildStatus.REBUILDING,
+    ]:
+        flash.error("Unable to delete exercise while a build is in progress")
         return redirect_to_next()
 
     mgr = ExerciseImageManager(exercise)

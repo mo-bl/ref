@@ -50,7 +50,7 @@ Exercises
                                 {% if e.build_job_status.value == 'FINISHED' %}
                                     <a role="button" class="btn btn-outline-{{ 'success' if e.is_default else 'danger'}}" href="{{ url_for('ref.exercise_toggle_default', exercise_id=e.id, next=request.path) }}">Default</a>
                                 {% endif %}
-                                {% if e.build_job_status.value not in ['FINISHED', 'BUILDING'] %}
+                                {% if e.build_job_status.value not in ['FINISHED', 'BUILDING', 'REBUILDING'] %}
                                     <a role="button" class="btn btn-outline-success" href="{{ url_for('ref.exercise_build', exercise_id=e.id, next=request.path) }}">Build</a>
                                 {% endif %}
                                 <div class="btn-group" role="group">
@@ -62,12 +62,16 @@ Exercises
                                             <a class="dropdown-item"  href="{{ url_for('ref.instances_view_by_exercise', exercise_name=e.short_name|quote_plus, exercise_version=e.version) }}">Instances</a>
                                         {% endif %}
 
-                                        {% if e.build_job_status.value == 'FINISHED' %}
+                                        {% if e.build_job_status.value in ['FINISHED', 'REBUILDING'] %}
                                             <a class="dropdown-item" href='.' onclick="displayToast('Copied to clipboard'); return copyStringToClipboard('ssh {{ e.short_name }}@{{ ssh_host }} -p {{ ssh_port  }}')"> SSH Command</a>
                                             <a class="dropdown-item" href='.' onclick="displayToast('Copied to clipboard'); return copyStringToClipboard('Host {{ e.short_name }}-{{ ssh_host }}\n\tHostName {{ ssh_host }}\n\tUser {{ e.short_name }}\n\tPort {{ ssh_port  }}\n\tPubkeyAuthentication yes')">SSH Config</a>
                                         {% endif %}
 
-                                        {% if e.build_job_status.value not in ['BUILDING'] %}
+                                        {% if e.build_job_status.value in ['FINISHED', 'FAILED'] %}
+                                            <a class="dropdown-item" href="{{ url_for('ref.exercise_rebuild', exercise_id=e.id, next=request.path) }}" data-toggle="tooltip" data-placement="left" title="Rebuild to pick up changes of the base image. Existing instances keep running on the previous image; new instances created after the rebuild finishes use the fresh one.">Rebuild</a>
+                                        {% endif %}
+
+                                        {% if e.build_job_status.value not in ['BUILDING', 'REBUILDING'] %}
                                             <a class="dropdown-item" href="{{ url_for('ref.exercise_browse', exercise_id=e.id) }}">Browse</a>
                                             <a class="dropdown-item ok-modal"  href="{{ url_for('ref.exercise_view', exercise_id=e.id) }}">View</a>
                                             <a class="dropdown-item confirm" href="{{ url_for('ref.exercise_delete', exercise_id=e.id, next=request.path) }}">Delete</a>
@@ -102,7 +106,7 @@ function toggleImportWarnings(icon) {
         var id = td.getAttribute('data-exercise-id');
         var status = td.getAttribute('data-build-status');
         initial[id] = status;
-        if (status === 'BUILDING') hasBuilding = true;
+        if (status === 'BUILDING' || status === 'REBUILDING') hasBuilding = true;
     });
 
     // Restore scroll position after reload (defer until page is fully laid out)

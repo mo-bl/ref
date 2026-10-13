@@ -231,6 +231,13 @@ class Exercise(CommonDbOpsMixin, ModelToStringMixin, db.Model):
     # Build status of the docker images that belong to the exercise
     build_job_status: Mapped[ExerciseBuildStatus]
 
+    # Number of successful atomic rebuilds applied to this exercise. Bumped
+    # at the end of __run_build (rebuild path) once promote completes. The
+    # value is snapshotted onto each Instance at creation time; on connect,
+    # an instance whose snapshotted counter is below this value is
+    # redeployed against the current image.
+    rebuild_counter: Mapped[int] = mapped_column(default=0)
+
     # All running instances of this exercise
     instances: Mapped[List["Instance"]] = relationship(
         "Instance", back_populates="exercise", lazy=True, passive_deletes="all"

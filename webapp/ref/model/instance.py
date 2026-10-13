@@ -182,6 +182,13 @@ class Instance(CommonDbOpsMixin, ModelToStringMixin, db.Model):
 
     creation_ts: Mapped[Optional[datetime.datetime]]
 
+    # Snapshot of Exercise.rebuild_counter at the time this instance was
+    # created (or last redeployed against a fresh rebuild). When this falls
+    # behind exercise.rebuild_counter, the next connect triggers a
+    # redeploy: the running container is recreated against the current
+    # image while the user's persistance overlay is preserved.
+    rebuild_counter: Mapped[int] = mapped_column(default=0)
+
     # All submission of this instance. If this list is empty, the instance was never submitted.
     submissions: Mapped[List["Submission"]] = relationship(
         "Submission",

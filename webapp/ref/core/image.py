@@ -20,6 +20,26 @@ from .exercise import Exercise, ExerciseBuildStatus
 
 log = get_logger(__name__)
 
+# Suffix appended to canonical image tags during an atomic rebuild. Builds
+# write to "<canonical>__ref-rebuild-tmp"; on full success the canonical tag
+# is reassigned (atomic) and the temp tag dropped. On failure the temp tag
+# is removed and the canonical is left untouched.
+_REBUILD_TMP_SUFFIX = "__ref-rebuild-tmp"
+
+
+def _temp_tag(canonical: str) -> str:
+    return canonical + _REBUILD_TMP_SUFFIX
+
+
+def _split_canonical(canonical: str) -> tuple[str, str]:
+    """Split ``repo:tag`` (the typical exercise image name) into the parts
+    docker-py's ``Image.tag(repository, tag=...)`` expects."""
+    if ":" in canonical:
+        repo, tag = canonical.rsplit(":", 1)
+        return repo, tag
+    return canonical, "latest"
+
+
 # Create a dedicated file logger for build operations that persists even on crash
 _build_file_logger: logging.Logger | None = None
 
@@ -187,7 +207,12 @@ class ExerciseImageManager:
         return cmd
 
     @staticmethod
-    def __docker_build(build_ctx_path: str, tag: str, dockerfile="Dockerfile") -> str:
+    def __docker_build(
+        build_ctx_path: str,
+        tag: str,
+        dockerfile="Dockerfile",
+        nocache: bool = False,
+    ) -> str:
         """
         Builds a docker image using the dockerfile named 'Dockerfile'
         that is located in the folder 'build_ctx_path' points to.
@@ -195,6 +220,7 @@ class ExerciseImageManager:
             build_ctx_path: The docker build context.
             tag: The image name.
             dockerfile: Name of the target Dockerfile.
+            nocache: Forwarded to docker; when True, no layer cache is used.
         Raises:
             *: If the image building process fails.
         Return:
@@ -203,7 +229,7 @@ class ExerciseImageManager:
         build_log = ""
         _log_build(
             f"[BUILD] Starting docker build: tag={tag}, "
-            f"dockerfile={dockerfile}, context={build_ctx_path}"
+            f"dockerfile={dockerfile}, context={build_ctx_path}, nocache={nocache}"
         )
         try:
             _log_build("[BUILD] Connecting to Docker daemon...")
@@ -213,7 +239,10 @@ class ExerciseImageManager:
                 "[BUILD] Connected. Starting image build (this may take a while)..."
             )
             image, json_log = images.build(
-                path=build_ctx_path, tag=tag, dockerfile=dockerfile
+                path=build_ctx_path,
+                tag=tag,
+                dockerfile=dockerfile,
+                nocache=nocache,
             )
             _log_build("[BUILD] Docker build command completed, processing log...")
             json_log = list(json_log)
@@ -235,7 +264,9 @@ class ExerciseImageManager:
             return build_log
 
     @staticmethod
-    def __run_build_entry_service(app, exercise: Exercise) -> str:
+    def __run_build_entry_service(
+        app, exercise: Exercise, rebuild: bool = False
+    ) -> str:
         """
         Builds the entry service of an exercise.
         Raises:
@@ -248,7 +279,11 @@ class ExerciseImageManager:
         )
 
         build_log = " --- Building entry service --- \n"
-        image_name = exercise.entry_service.image_name
+        canonical_name = exercise.entry_service.image_name
+        # On rebuild, write to a temp tag and let the caller promote it
+        # atomically once every service has finished building. The canonical
+        # tag stays pointed at the previous-good image throughout.
+        image_name = _temp_tag(canonical_name) if rebuild else canonical_name
         _log_build(f"[BUILD] Entry service image name: {image_name}")
 
         try:
@@ -280,7 +315,10 @@ class ExerciseImageManager:
                 f.write(dockerfile)
             _log_build("[BUILD] Dockerfile-entry written, starting docker build...")
             build_log += ExerciseImageManager.__docker_build(
-                build_ctx, image_name, dockerfile="Dockerfile-entry"
+                build_ctx,
+                image_name,
+                dockerfile="Dockerfile-entry",
+                nocache=rebuild,
             )
 
             _log_build("[BUILD] Entry service docker build completed successfully")
@@ -311,7 +349,9 @@ class ExerciseImageManager:
                 f"Traceback:\n{traceback.format_exc()}",
                 level=logging.ERROR,
             )
-            # Cleanup on failure
+            # Cleanup on failure. On rebuild, image_name is the temporary
+            # build tag (see top of this function), so this rmi never
+            # touches the canonical tag — safe to run unconditionally.
             try:
                 if dc.image(image_name):
                     dc.rmi(image_name)
@@ -348,7 +388,9 @@ class ExerciseImageManager:
         return build_log
 
     @staticmethod
-    def __run_build_peripheral_services(app, exercise: Exercise) -> str:
+    def __run_build_peripheral_services(
+        app, exercise: Exercise, rebuild: bool = False
+    ) -> str:
         """
         Builds the peripheral services of an exercise.
         Raises:
@@ -379,7 +421,11 @@ class ExerciseImageManager:
                 build_log_output = (
                     f" --- Building peripheral service {service.name} --- \n"
                 )
-                image_name = service.image_name
+                # On rebuild: write to a temp tag (same scheme as the entry
+                # service); the caller promotes all temp tags atomically.
+                image_name = (
+                    _temp_tag(service.image_name) if rebuild else service.image_name
+                )
 
                 flag_cmds = ExerciseImageManager.__build_flag_docker_cmd(service)
 
@@ -397,7 +443,10 @@ class ExerciseImageManager:
                 with open(f"{build_ctx}/{dockerfile_name}", "w") as f:
                     f.write(dockerfile)
                 build_log_output += ExerciseImageManager.__docker_build(
-                    build_ctx, image_name, dockerfile=dockerfile_name
+                    build_ctx,
+                    image_name,
+                    dockerfile=dockerfile_name,
+                    nocache=rebuild,
                 )
                 _log_build(f"[BUILD] Peripheral service {service.name} build complete")
 
@@ -435,7 +484,103 @@ class ExerciseImageManager:
                 dc.rmi(name, force=force)
 
     @staticmethod
-    def __run_build_by_id(app, exercise_id: int):
+    def __exercise_canonical_tags(exercise: Exercise) -> List[str]:
+        return [exercise.entry_service.image_name] + [
+            svc.image_name for svc in exercise.services
+        ]
+
+    @staticmethod
+    def __promote_rebuild_tags(exercise: Exercise) -> None:
+        """Promote each temp tag to its canonical name with rollback.
+
+        Each individual ``img.tag(canonical)`` is atomic — docker silently
+        reassigns the tag to the new image id, and any container holding
+        the old image keeps it alive by id. If the loop fails partway
+        through (e.g. daemon hiccup), the canonicals that were already
+        promoted are rolled back to their previously-snapshotted image
+        ids before re-raising. ``docker tag`` is metadata-only and
+        practically never fails, but the rollback closes the
+        last-known cross-service inconsistency window.
+        """
+        dc = DockerClient()
+        canonicals = ExerciseImageManager.__exercise_canonical_tags(exercise)
+
+        # Snapshot the old image id for each canonical so we can restore it
+        # on partial-promote failure. The snapshot must happen before any
+        # `tag()` call below — once we promote, the canonical no longer
+        # points at the old image (though docker keeps the old image alive
+        # while running containers reference it, so the id stays resolvable).
+        old_ids: dict[str, str] = {}
+        for canonical in canonicals:
+            old_img = dc.image(canonical)
+            if old_img is not None:
+                old_ids[canonical] = old_img.id
+
+        promoted: List[str] = []
+        try:
+            for canonical in canonicals:
+                temp = _temp_tag(canonical)
+                new_img = dc.image(temp)
+                if new_img is None:
+                    # Service contributed no temp image (e.g. exercise has
+                    # no peripheral services). Nothing to promote.
+                    continue
+                repo, tag_part = _split_canonical(canonical)
+                new_img.tag(repo, tag=tag_part)
+                promoted.append(canonical)
+                try:
+                    dc.rmi(temp)
+                except Exception:
+                    # Untagging the temp may race other ops; a leftover
+                    # temp tag is harmless — the next rebuild will
+                    # overwrite it.
+                    pass
+        except Exception:
+            _log_build(
+                f"[BUILD] Promote loop failed after promoting {promoted}; "
+                "rolling canonical tags back to previous-good image ids.",
+                level=logging.ERROR,
+            )
+            for canonical in promoted:
+                old_id = old_ids.get(canonical)
+                if old_id is None:
+                    continue
+                try:
+                    old_img = dc.image(old_id)
+                    if old_img is None:
+                        # Unexpected: the old image got reaped between
+                        # snapshot and rollback. Nothing we can do.
+                        _log_build(
+                            f"[BUILD] Rollback of {canonical}: previous "
+                            f"image {old_id} no longer exists.",
+                            level=logging.ERROR,
+                        )
+                        continue
+                    repo, tag_part = _split_canonical(canonical)
+                    old_img.tag(repo, tag=tag_part)
+                except Exception as rb_e:
+                    _log_build(
+                        f"[BUILD] Rollback of {canonical} to {old_id} "
+                        f"failed: {rb_e}. Exercise may be in an "
+                        "inconsistent state — manual intervention required.",
+                        level=logging.ERROR,
+                    )
+            raise
+
+    @staticmethod
+    def __purge_rebuild_temp_tags(exercise: Exercise) -> None:
+        """Best-effort removal of any leftover rebuild temp tags."""
+        dc = DockerClient()
+        for canonical in ExerciseImageManager.__exercise_canonical_tags(exercise):
+            temp = _temp_tag(canonical)
+            try:
+                if dc.image(temp):
+                    dc.rmi(temp, force=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def __run_build_by_id(app, exercise_id: int, rebuild: bool = False):
         """
         Wrapper that loads the exercise fresh inside the thread context
         to avoid SQLAlchemy detached instance issues. The entire build
@@ -481,7 +626,7 @@ class ExerciseImageManager:
                     svc.exercise = exercise
                 app.db.session.expunge(config)
                 app.db.session.commit()
-                ExerciseImageManager.__run_build(app, exercise)
+                ExerciseImageManager.__run_build(app, exercise, rebuild=rebuild)
             _log_build(f"[BUILD] Build thread finished for exercise_id={exercise_id}")
         except Exception as e:
             _log_build(
@@ -491,7 +636,7 @@ class ExerciseImageManager:
             )
 
     @staticmethod
-    def __run_build(app, exercise: Exercise):
+    def __run_build(app, exercise: Exercise, rebuild: bool = False):
         """
         Builds all docker images that are needed by the passed exercise.
         Note: This function must be called from within an app_context() - do not
@@ -503,14 +648,23 @@ class ExerciseImageManager:
         try:
             # Build entry service
             _log_build("[BUILD] Building entry service...")
-            log_buffer += ExerciseImageManager.__run_build_entry_service(app, exercise)
+            log_buffer += ExerciseImageManager.__run_build_entry_service(
+                app, exercise, rebuild=rebuild
+            )
             _log_build(
                 "[BUILD] Entry service build complete. Building peripheral services..."
             )
             log_buffer += ExerciseImageManager.__run_build_peripheral_services(
-                app, exercise
+                app, exercise, rebuild=rebuild
             )
             _log_build("[BUILD] Peripheral services build complete.")
+
+            # All builds wrote to temp tags on rebuild. Promote them to
+            # their canonical names atomically — this is the only step that
+            # makes the new image visible to instance provisioning.
+            if rebuild:
+                _log_build("[BUILD] Promoting rebuild temp tags to canonical names...")
+                ExerciseImageManager.__promote_rebuild_tags(exercise)
         except Exception as e:
             _log_build(
                 f"[BUILD] Exception caught in __run_build: {type(e).__name__}: {e}",
@@ -541,25 +695,40 @@ class ExerciseImageManager:
                 f"[BUILD] Build FAILED for {exercise.short_name}", level=logging.ERROR
             )
             exercise.build_job_status = ExerciseBuildStatus.FAILED
-            try:
-                ExerciseImageManager.__purge_entry_service_image(exercise)
-                ExerciseImageManager.__purge_peripheral_services_images(exercise)
-            except Exception as cleanup_e:
-                _log_build(
-                    f"[BUILD] Cleanup failed: {cleanup_e}\n"
-                    f"Traceback:\n{traceback.format_exc()}",
-                    level=logging.ERROR,
-                )
+            if rebuild:
+                # Canonical tags still point at the previous-good images
+                # (we only ever wrote to temp tags). Don't touch them; just
+                # clean up any temp tags from services that did finish
+                # before the failure.
+                ExerciseImageManager.__purge_rebuild_temp_tags(exercise)
+            else:
+                try:
+                    ExerciseImageManager.__purge_entry_service_image(exercise)
+                    ExerciseImageManager.__purge_peripheral_services_images(exercise)
+                except Exception as cleanup_e:
+                    _log_build(
+                        f"[BUILD] Cleanup failed: {cleanup_e}\n"
+                        f"Traceback:\n{traceback.format_exc()}",
+                        level=logging.ERROR,
+                    )
         else:
             _log_build(f"[BUILD] Build SUCCEEDED for {exercise.short_name}")
             exercise.build_job_status = ExerciseBuildStatus.FINISHED
+            if rebuild:
+                # Bump the rebuild generation so existing instances on the
+                # previous image get redeployed on their next connect.
+                exercise.rebuild_counter = (exercise.rebuild_counter or 0) + 1
+                _log_build(
+                    f"[BUILD] Bumped rebuild_counter to "
+                    f"{exercise.rebuild_counter} for {exercise.short_name}"
+                )
 
         _log_build("[BUILD] Committing build result to DB...")
         exercise = app.db.session.merge(exercise)
         app.db.session.commit()
         _log_build("[BUILD] Build result committed to DB")
 
-    def build(self, wait: bool = False) -> None:
+    def build(self, wait: bool = False, rebuild: bool = False) -> None:
         """
         Builds all images required for the exercise. This process happens in
         a separate thread that updates the exercise after the build process
@@ -568,23 +737,37 @@ class ExerciseImageManager:
 
         Args:
             wait: If True, block until the build completes. Useful for testing.
+            rebuild: If True, treat this as an in-place rebuild over an
+                already-built image: keep the existing tag in place for the
+                duration of the build (so new instance provisioning keeps
+                working off the old image), bypass the docker layer cache
+                (so a refreshed base image is picked up), and leave the
+                tag alone on failure. Docker atomically reassigns the tag
+                to the new image when ``images.build()`` succeeds.
         """
-        _log_build(f"[BUILD] build() called for exercise {self.exercise}, wait={wait}")
-        self.delete_images()
+        _log_build(
+            f"[BUILD] build() called for exercise {self.exercise}, "
+            f"wait={wait}, rebuild={rebuild}"
+        )
+        if not rebuild:
+            self.delete_images()
 
         # Store the exercise ID to pass to the thread - the thread will
         # reload the exercise with a fresh session to avoid detached
         # instance issues.
         exercise_id = self.exercise.id
 
-        # Set BUILDING status after delete_images (which sets NOT_BUILD),
+        # Set the in-progress status (REBUILDING for atomic rebuilds, where
+        # the canonical image tag is still serving; BUILDING otherwise),
         # then commit to release the database advisory lock before starting
         # the build thread. The thread needs to acquire this lock to access
         # the database, so we must release it first or the thread will block
         # until the caller's transaction completes.
         from ref import db
 
-        self.exercise.build_job_status = ExerciseBuildStatus.BUILDING
+        self.exercise.build_job_status = (
+            ExerciseBuildStatus.REBUILDING if rebuild else ExerciseBuildStatus.BUILDING
+        )
         self.exercise.build_job_result = None
         db.session.commit()
 
@@ -592,6 +775,7 @@ class ExerciseImageManager:
         t = Thread(
             target=ExerciseImageManager.__run_build_by_id,
             args=(current_app._get_current_object(), exercise_id),
+            kwargs={"rebuild": rebuild},
         )
         t.start()
 

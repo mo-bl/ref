@@ -54,6 +54,9 @@ class InstanceManager:
         instance.creation_ts = datetime.datetime.utcnow()
         instance.exercise = exercise
         instance.user = user
+        # Snapshot the exercise's rebuild generation. Used at connect time
+        # to detect a stale instance and trigger a redeploy.
+        instance.rebuild_counter = exercise.rebuild_counter or 0
         exercise.instances.append(instance)
 
         # Create the entry service

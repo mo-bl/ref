@@ -87,7 +87,25 @@ def start_and_return_instance(
         )
 
     instance_manager = InstanceManager(instance)
-    if not instance_manager.is_running():
+
+    # If the exercise was rebuilt since this instance was created, redeploy
+    # the container against the current canonical image. The user's
+    # persistance overlay is preserved across this — only the container is
+    # recreated. instance_manager.start() does a stop() first, so calling
+    # it unconditionally here gets us a fresh container regardless of the
+    # previous running state.
+    instance_rev = instance.rebuild_counter or 0
+    exercise_rev = instance.exercise.rebuild_counter or 0
+    if instance_rev < exercise_rev:
+        log.info(
+            f"Instance ({instance}) is stale (rebuild_counter "
+            f"{instance_rev} < {exercise_rev}); redeploying against "
+            "current image."
+        )
+        instance_manager.start()
+        instance.rebuild_counter = exercise_rev
+        db.session.add(instance)
+    elif not instance_manager.is_running():
         log.info(f"Instance ({instance}) is not running. Starting..")
         instance_manager.start()
 
